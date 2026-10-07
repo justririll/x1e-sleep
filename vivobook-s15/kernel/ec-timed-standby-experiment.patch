@@ -1,0 +1,79 @@
+--- a/drivers/platform/arm64/asus-vivobook-s15.c
++++ b/drivers/platform/arm64/asus-vivobook-s15.c
+@@ -68,6 +68,12 @@
+ 
+ #define EC_TEMP_PERIOD_MS	2000
+ 
++/* Experimental BIOS .367 timed-standby policy override; opt in explicitly. */
++static bool disable_standby_timer;
++module_param(disable_standby_timer, bool, 0444);
++MODULE_PARM_DESC(disable_standby_timer,
++		 "Experimentally disable EC timed standby during system sleep");
++
+ enum ec_profile {
+ 	EC_PROFILE_WHISPER,
+ 	EC_PROFILE_STANDARD,
+@@ -147,6 +153,8 @@
+ 		 "Temperature (mВ°C) reported when no thermal zone is readable");
+ 
+ struct asus_ec {
++	u8 standby_timer_saved;
++	bool standby_timer_restore;
+ 	struct device *dev;
+ 	struct i2c_client *client;	/* 0x76 */
+ 	struct i2c_client *mailbox;	/* 0x5B */
+@@ -900,6 +908,41 @@
+ 
+ 	mutex_lock(&ec->lock);
+ 	ret = ec_set_suspend(ec, true);
++	if (!ret && disable_standby_timer) {
++		u8 value;
++
++		ret = ec_ram_read(ec, 0xca, 0x68, &value);
++		if (!ret && value > 1)
++			ret = -EINVAL;
++		if (!ret) {
++			ec->standby_timer_saved = value;
++			ec->standby_timer_restore = true;
++			ret = ec_ram_write(ec, 0xca, 0x68, 0);
++		}
++		if (!ret)
++			ret = ec_ram_read(ec, 0xca, 0x68, &value);
++		if (!ret && value)
++			ret = -EIO;
++		if (ret) {
++			int rollback;
++
++			/* Undo the sleep notification before restarting temperature work. */
++			rollback = ec_set_suspend(ec, false);
++			if (rollback)
++				dev_err(dev, "EC sleep rollback failed: %d\n", rollback);
++			if (ec->standby_timer_restore) {
++				rollback = ec_ram_write(ec, 0xca, 0x68,
++							ec->standby_timer_saved);
++				if (rollback)
++					dev_err(dev, "EC timer rollback failed: %d\n", rollback);
++				else
++					ec->standby_timer_restore = false;
++			}
++		} else {
++			dev_info(dev, "EC timed-standby flag %u -> 0 for sleep\n",
++				 ec->standby_timer_saved);
++		}
++	}
+ 	mutex_unlock(&ec->lock);
+ 
+ 	if (ret) {
+@@ -917,6 +960,12 @@
+ 
+ 	if (ec_set_suspend(ec, false))
+ 		dev_err(dev, "failed to wake EC\n");
++	if (ec->standby_timer_restore) {
++		if (ec_ram_write(ec, 0xca, 0x68, ec->standby_timer_saved))
++			dev_err(dev, "failed to restore EC timed-standby flag\n");
++		else
++			ec->standby_timer_restore = false;
++	}
+ 
+ 	if (ec_write_profile(ec, ec->profile) || ec_set_manual(ec, ec->manual))
+ 		dev_warn(dev, "failed to restore fan state\n");

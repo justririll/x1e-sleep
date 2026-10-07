@@ -1,0 +1,182 @@
+# Deep sleep on the ASUS Vivobook S15 (S5507QA, Snapdragon X Elite X1E80100)
+
+> **Disclaimer: this is vibe coding.** Almost everything here was written
+> and debugged with AI assistants (Claude, plus another model for firmware
+> analysis), with a human driving the tests on real hardware. Treat it as
+> experimental research notes and test patches, not reviewed kernel code.
+> Nothing here has been sent upstream yet. Use at your own risk.
+
+## Result
+
+With all of this applied, s2idle on this laptop reaches the deepest
+platform state (AOP stats: `ddr`, `cxsd` and `aosd` all accumulate for
+~99.7% of the sleep time). The battery drain in sleep is **~0.25 W**
+(1886 s, 130 mWh). Windows Modern Standby on the same laptop measured
+~0.23 W. Before this work the drain was ~4 W.
+
+Setup this was tested on:
+
+- BIOS .367;
+- Linux 7.2 from [jglathe/linux_ms_dev_kit](https://github.com/jglathe/linux_ms_dev_kit/tree/jg/ubuntu-qcom-x1e-7.2.y), branch `jg/ubuntu-qcom-x1e-7.2.y` @ `0aaff8f`, NixOS;
+- Linux running at **EL2** through slbounce, with the DSPs started by
+  qebspil. Some parts (el1tmr, qebspil) only matter at EL2.
+
+Known open issue: rare hard resets during long full-DRIPS sleeps. Cause unknown.
+Statistics on the current build are still being collected.
+
+## Layout
+
+Generic X1E80100 (Hamoa) material sits at the top level. Everything
+specific to this laptop is in `vivobook-s15/`.
+
+```
+qebspil/                    patch for qebspil (git format-patch against 8e4d9e6)
+kernel/upstream-backports/  fixes taken from upstream or lore
+kernel/sleep/               our own X1E sleep/power fixes
+kernel/experimental/        DC ZVA erratum + CL5
+modules/                    out-of-tree modules (EL2 timer helper, ADSP messages)
+vivobook-s15/kernel/        EC + keyboard drivers and DT fixes for this laptop
+vivobook-s15/nixos/         the NixOS module that wires everything together
+vivobook-s15/scripts/       suspend energy log
+```
+
+## qebspil
+
+`qebspil/0001-pil-send-AOSS-load_state-off-on-before-starting-ADSP.patch`
+
+- **Problem:** qebspil starts ADSP/CDSP from UEFI, but AOSS is never told
+  that the images run (Linux PAS sends `load_state on` through QMP in
+  `qcom_q6v5_prepare()`). After the first DDR low-power mode in s2idle the
+  ADSP went silent: GLINK TX hung, battmgr returned -110, and the system
+  died a few seconds after resume.
+- **Fix:** a minimal polled AOSS QMP client (`src/qmp.c`) sends
+  `load_state off` and then `on` for adsp/cdsp right before
+  auth_and_reset, as a Linux PAS stop + start would.
+
+## Kernel: upstream backports
+
+| Patch | What | Upstream status |
+|---|---|---|
+| `drm-msm-a6xx-fix-stale-rpmh-votes.patch` | `a6xx_rpmh_stop()` had an inverted `GMU_STATUS_FW_START` check, so after the GMU had run, the GPU RSC never went to sleep. Its RPMh votes then blocked CXSD and DDR LPM. This was the first big sleep blocker. The backport also halts the GMU CM3 core before `rpmh_stop`, like upstream. | **Merged upstream** ("drm/msm/a6xx: Fix stale rpmh votes after suspend", Shivam Rawat / Akhil P Oommen). Not in 7.2. |
+| `qcom-pdc-wake-and-ss3.patch` | Qualcomm PDC series v4 (GPIO wake through PDC, X1E PDC secondary mode, pinctrl, and the `domain_ss3` system idle state `0x0200c354` in `hamoa.dtsi`). | **Merged upstream** (current master has the X1E quirk and `domain_ss3`). |
+| `scmi-qcom-memlat-rfc-v7.patch` | Qualcomm SCMI vendor protocol + memlat (Sibi Sankar, RFC v7). CPUCP scales DDR/LLCC by memory latency. Not needed for sleep; it improved memory bandwidth. | RFC on lore, not merged. |
+
+## Kernel: our sleep fixes
+
+| Patch | What | Upstream status |
+|---|---|---|
+| `lpass-macro-release-votes-in-runtime-suspend.patch` | The LPASS tx and rx macro drivers enable the `macro` and `dcodec` clocks (q6prm LPASS_HW_MACRO/DCODEC votes to the ADSP) in probe and drop them only in remove. The ADSP then keeps the audio core clock voted forever, so AOP never collapses CX or turns off XO (`cxsd`/`aosd` stay 0). The va and wsa macros already handle this through pm_clk. The patch takes the votes in runtime resume and drops them in runtime suspend. Sound still works. The leak was first found by valpackett. | **Fixed upstream in 7.3** by Ajay Kumar Nandam (Qualcomm): "ASoC: codecs: lpass-{tx,rx}-macro: switch to PM clock framework" (b9b23e72ab, b05482e7ce). Needed only for older kernels such as jglathe 7.2. |
+| `vivobook-s15/kernel/dts-vivobook-s15-edp-regulator-not-always-on.patch` | `VREG_EDP_3P3` (the 3.3 V supply of the Samsung ATNA56AC03 OLED panel) was `regulator-always-on`, so the panel stayed powered in s2idle. Removing it cut sleep drain from **~1.43 W to ~0.25 W**. The panel driver powers the panel through runtime PM; `regulator-boot-on` is kept. Other X1E boards with the same pattern may have the same leak. | Not upstream; master still has `regulator-always-on`. |
+| `pmdomain-system-sleep-only.patch` | Generic genpd and DT-binding change: a domain idle state marked `system-sleep-only` is never picked by runtime idle, only by system suspend. See "Runtime DRIPS" below. | Not upstream. |
+| `dts-hamoa-add-ss1-idle-state.patch` | Adds platform.SS1 (`0x02000154`, from ACPI `\_SB.SYSM._LPI`) as a shallower system idle state and marks DRIPS `system-sleep-only`. See "Runtime DRIPS" below. | Not upstream. |
+| `tty-serial-qcom-geni-power-down-in-s2idle.patch` | With Bluetooth up, `hci_uart` keeps the BT UART (geni SE `a98000`) open. `uart_suspend_port()` powers it down with `pm_runtime_put_sync()`, but during system suspend the PM core holds a runtime PM reference, so this is a no-op: the SE clocks, interconnect and CX performance votes stayed on through s2idle and AOP never collapsed CX or turned XO off (`cxsd`/`aosd` = 0, DDR-only sleep). The patch forces runtime suspend in the late suspend phase (console and wakeup ports are left alone). Bluetooth keeps working after resume. | Not upstream. |
+| `syscon-skip-clock-of-clock-providers.patch` | syscon attached the parent clock of the TCSR clock provider (`bi_tcxo`) as its register clock and kept it prepared, which pinned an RPMh XO vote. Skip `clocks` for nodes with `#clock-cells`. | Not upstream. |
+| `pcie-qcom-keep-gen1-icc-vote.patch` | After link up, pcie-qcom votes full link bandwidth, which pinned DDR at 2092 MHz while the link idled in L1ss. Keep the boot-time Gen1 x1 vote. Debatable: real DMA traffic relies on the LLCC to DDR BWMON. | Not upstream. |
+
+## Runtime DRIPS: how Windows does it
+
+After the first s2idle, entering the deepest system state (DRIPS,
+`0x0200c354`) from **runtime** idle hangs the SoC. This was proven to be on
+the TZ side: with a kprobe that skips the `PSCI_SYSTEM_SUSPEND` SMC the
+system stays alive.
+
+A Windows WPR trace (Kernel-Processor-Power `PlatformIdleVeto`) showed
+that Windows never enters DRIPS while the screen is on. The PEP vetoes it
+(reasons 4/5/8) and only allows platform.SS1. DRIPS is used only in Modern
+Standby. We do the same:
+
+- `kernel/sleep/pmdomain-system-sleep-only.patch` adds a
+  `system-sleep-only` property for domain idle states. The runtime genpd
+  governor skips such a state, but `genpd_sync_power_off()` (s2idle) still
+  uses it.
+- `dts-hamoa-add-ss1-idle-state.patch` adds SS1 and marks DRIPS
+  (`domain_ss3`) `system-sleep-only`. Runtime idle then gets CL5 and SS1,
+  and DRIPS is used only in s2idle.
+
+An earlier version did the same with a 4500 µs per-CPU resume-latency QoS
+from `el1tmr`. That worked only at EL2, because the module refuses to load
+at EL1.
+
+## Kernel: Vivobook support
+
+`vivobook-s15/kernel/vivobook-s15-ec-hid.patch`:
+
+- **EC driver** (`drivers/platform/arm64/asus-vivobook-s15.c`): fan
+  RPM/PWM/profiles, SoC temperature feed, keyboard RGB. Suspend notifies
+  the EC with `0x23 01` and resume with `0x23 00`. This is exactly what
+  Windows sends: the DSDT `PEP0._DSM` Modern Standby entry/exit
+  (UUID `11e00d56…`, functions 7/8) writes EC command `0x23` on I2C6 at
+  address 0x76.
+- **The EC driver is work in progress.** Notes on the EC protocol:
+  - EC command `0x20` takes a sensor channel byte: `{0x20, channel, 0x02,
+    temp_lo, temp_hi}`, temperature in 0.1 °C.
+  - The ACPI tables can also feed thermal zones `TZ31`…`TZ37` as
+    channels 2…8.
+  - A Windows kernel-debugger capture of the AML debug output showed that
+    Windows only sends channel 1 (SoC Tj, about once a second), the same
+    as this driver.
+  - Still missing: battery health that MyASUS reads through the EC (SBS
+    registers: cycle count, full/design capacity), plus a few unknown EC
+    registers that MyASUS polls. See `ASUS_EC.md`.
+- **Keyboard driver** (`hid-asus-vivobook-s15`): Fn hotkeys, backlight,
+  Fn-lock.
+- The EC node in the DT.
+
+## Kernel: DC ZVA and CL5 (`kernel/experimental/`)
+
+- `x1-dc-zva-erratum-and-cl5.patch`:
+  - On this firmware `DC ZVA` is broken once the clusters use the CL5
+    power-collapse state: it can hard-reset the machine (see
+    icecream95/x1e-crash).
+  - jglathe's tree avoids that by not using CL5.
+  - This patch takes Marc Zyngier's Oryon erratum, which disables `DC ZVA`
+    for EL0 and emulates it, and extends it to the kernel (`clear_page`,
+    `memset`, MTE). With the erratum in place it enables CL5 on all three
+    clusters.
+  - Upstream master (7.3-rc5) has CL5 in `hamoa.dtsi` but no `DC ZVA`
+    workaround in `cpu_errata.c` that we could find, so mainline may need
+    this too.
+
+## Modules
+
+- `el1tmr`, EL2 only:
+  - Under VHE Linux ticks on the EL2 physical timer, while the secure
+    firmware computes the APSS wake-up deadline from the EL1 timers. The
+    module copies the CNTHP deadline into `CNTP_*_EL02` (interrupt masked)
+    before power-down idle states and parks it far away after.
+  - It also disables the EL1 virtual timer that UEFI leaves armed: that
+    timer made the firmware abort every system-level entry.
+  - Do not load it while KVM guests run.
+- `adsp-pwr-lmts` (`qcom_adsp_pwr_lmts`):
+  - An rpmsg driver for the ADSP `APPS_ADSP_PWR_LMTS_GLINK_PORT` channel.
+  - It sends the 24-byte `MODERN_STANDBY_STATE` message that Windows PEP
+    (`qcpep8380.sys`) sends: state 1 on system suspend, 0 on resume.
+  - On entry the ADSP stops its power-limits timer, which otherwise wakes
+    it ~100 times/s.
+  - It replaces an earlier userspace script that sent the same message from the suspend hooks.
+- `adsp-sleepstate`: drives the outbound SMP2P `sleepstate` bit to the
+  ADSP like Windows `qcsubsys`: 0x1000 while awake, 0 on suspend. Needs
+  the `adsp-sleepstate` DT overlay from `vivobook-s15/nixos/vivobook-s15.nix`.
+  Whether it is really needed is still being tested.
+
+## Scripts (`vivobook-s15/scripts/`)
+
+- `sleep-log.sh pre|post`: logs battery energy and the AOP
+  `ddr`/`cxsd`/`aosd` counters around each suspend to
+  `/var/log/sleep-energy.log`. Drain in W is
+  `(e_pre - e_post) / (t_post - t_pre) * 3.6e-3` (energy is in µWh).
+
+## Other settings that matter (see `vivobook-s15/nixos/vivobook-s15.nix`)
+
+- `msm.psr_enabled=0`: PSR caused green stripes on the panel.
+- `qcrypto` blacklisted: QCE holds an always-on DDR bandwidth vote.
+- `nvme.quirks=1344:5413:simple_suspend`.
+
+## Credits
+
+- valpackett: the LPASS macro vote leak.
+- Shivam Rawat / Akhil P Oommen: GMU fix.
+- Qualcomm: PDC series, memlat RFC.
+- Marc Zyngier: the DC ZVA erratum.
+- jglathe: kernel tree.
+- The slbounce and qebspil authors.

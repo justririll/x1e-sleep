@@ -1,0 +1,16 @@
+arm64: dts: qcom: x1-asus-vivobook-s15: let the panel switch off its 3.3 V
+
+VREG_EDP_3P3 only feeds the Samsung ATNA56AC03 OLED panel, whose driver
+powers it via runtime PM. regulator-always-on kept the panel powered in
+s2idle; keep boot-on so the bootloader handoff stays seamless.
+
+--- a/arch/arm64/boot/dts/qcom/x1-asus-vivobook-s15.dtsi
++++ b/arch/arm64/boot/dts/qcom/x1-asus-vivobook-s15.dtsi
+@@ -208,7 +208,6 @@
+ 		pinctrl-0 = <&edp_reg_en>;
+ 		pinctrl-names = "default";
+ 
+-		regulator-always-on;
+ 		regulator-boot-on;
+ 	};
+ 

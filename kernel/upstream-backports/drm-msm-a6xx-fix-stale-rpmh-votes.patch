@@ -1,0 +1,31 @@
+drm/msm/a6xx: Fix stale rpmh votes after suspend
+
+Backport of the upstream fix by Shivam Rawat / Akhil P Oommen (lkml 2026-06,
+"drm/msm/a6xx: Fix stale rpmh votes after suspend",
+Fixes: f248d5d5159a "drm/msm/a6xx: Fix PDC sleep sequence"):
+the GMU_STATUS_FW_START check in a6xx_rpmh_stop() was inverted, so the GPU RSC
+was never put to sleep after the GMU firmware had run and its RPMh (BCM/ARC)
+votes stayed active -> AOP never entered CXSD / DDR LPM in s2idle on X1E.
+Also halt the GMU CM3 core on shutdown.
+
+--- a/drivers/gpu/drm/msm/adreno/a6xx_gmu.c	2026-10-02 20:46:27.080480601 +0300
++++ b/drivers/gpu/drm/msm/adreno/a6xx_gmu.c	2026-10-02 20:47:29.746378410 +0300
+@@ -642,7 +642,7 @@
+ 	int ret;
+ 	u32 val;
+ 
+-	if (test_and_clear_bit(GMU_STATUS_FW_START, &gmu->status))
++	if (!test_and_clear_bit(GMU_STATUS_FW_START, &gmu->status))
+ 		return;
+ 
+ 	if (adreno_is_a840(adreno_gpu))
+@@ -1465,6 +1465,9 @@
+ 	/* Stop the interrupts and mask the hardware */
+ 	a6xx_gmu_irq_disable(gmu);
+ 
++	/* Halt the gmu cm3 core */
++	gmu_write(gmu, REG_A6XX_GMU_CM3_SYSRESET, 1);
++
+ 	/* Tell RPMh to power off the GPU */
+ 	a6xx_rpmh_stop(gmu);
+ 

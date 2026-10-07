@@ -1,0 +1,51 @@
+tty: serial: qcom-geni: power the port down in s2idle
+
+uart_suspend_port() relies on pm_runtime_put_sync(), which is a no-op
+during system suspend; an open port (hci_uart for Bluetooth) kept its
+clocks, interconnect and CX performance votes, so AOP never collapsed CX
+or turned XO off on X1E. Force runtime suspend in the late phase.
+
+--- a/drivers/tty/serial/qcom_geni_serial.c	2026-10-03 21:10:01.852109693 +0300
++++ b/drivers/tty/serial/qcom_geni_serial.c	2026-10-03 21:10:01.870127377 +0300
+@@ -2044,10 +2044,41 @@
+ 	.set_rate = geni_serial_set_level,
+ };
+ 
++/*
++ * uart_suspend_port() powers an open, non-wakeup port down through
++ * ->pm(OFF) -> pm_runtime_put_sync(), but the PM core holds a runtime PM
++ * reference during system suspend, so the SE clocks, the interconnect vote
++ * and the CX performance vote stay on all through s2idle. With Bluetooth up
++ * (port held open by hci_uart) this kept CX and XO on on X1E. Force the
++ * runtime-suspended state late in system suspend; console and wakeup ports
++ * are left alone.
++ */
++static int qcom_geni_serial_suspend_late(struct device *dev)
++{
++	struct qcom_geni_serial_port *port = dev_get_drvdata(dev);
++
++	if (uart_console(&port->uport) || device_may_wakeup(dev))
++		return 0;
++
++	return pm_runtime_force_suspend(dev);
++}
++
++static int qcom_geni_serial_resume_early(struct device *dev)
++{
++	struct qcom_geni_serial_port *port = dev_get_drvdata(dev);
++
++	if (uart_console(&port->uport) || device_may_wakeup(dev))
++		return 0;
++
++	return pm_runtime_force_resume(dev);
++}
++
+ static const struct dev_pm_ops qcom_geni_serial_pm_ops = {
+ 	SET_RUNTIME_PM_OPS(qcom_geni_serial_runtime_suspend,
+ 			   qcom_geni_serial_runtime_resume, NULL)
+ 	SYSTEM_SLEEP_PM_OPS(qcom_geni_serial_suspend, qcom_geni_serial_resume)
++	LATE_SYSTEM_SLEEP_PM_OPS(qcom_geni_serial_suspend_late,
++				 qcom_geni_serial_resume_early)
+ };
+ 
+ static const struct of_device_id qcom_geni_serial_match_table[] = {
