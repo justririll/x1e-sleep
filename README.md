@@ -21,8 +21,14 @@ Setup this was tested on:
 - Linux running at **EL2** through slbounce, with the DSPs started by
   qebspil. Some parts (el1tmr, qebspil) only matter at EL2.
 
-Known open issue: rare hard resets during long full-DRIPS sleeps. Cause unknown.
-Statistics on the current build are still being collected.
+**Known open issue: hard resets in long full-DRIPS sleeps.** The reset
+(`PM: Reset by PSHOLD`, `Reset Type: Hard Reset` in the next boot's XBL
+log) lands at about *N hours + ~38 s after boot*, not at a fixed time after
+suspend, and only while the SoC is in AOSD (XO off). With AOSD inhibited
+over QMP (`{class: aoss_slp, res: sleep, val: disable}`; CXSD and DDR
+sleep stay allowed) a 70 min sleep across that boundary survived, at
+~0.17 W. The periodic trigger and the initiator of the reset are not known
+yet. Not tested at EL1 so far.
 
 ## Layout
 
@@ -59,6 +65,8 @@ vivobook-s15/scripts/       suspend energy log
 |---|---|---|
 | `drm-msm-a6xx-fix-stale-rpmh-votes.patch` | `a6xx_rpmh_stop()` had an inverted `GMU_STATUS_FW_START` check, so after the GMU had run, the GPU RSC never went to sleep. Its RPMh votes then blocked CXSD and DDR LPM. This was the first big sleep blocker. The backport also halts the GMU CM3 core before `rpmh_stop`, like upstream. | **Merged upstream** ("drm/msm/a6xx: Fix stale rpmh votes after suspend", Shivam Rawat / Akhil P Oommen). Not in 7.2. |
 | `qcom-pdc-wake-and-ss3.patch` | Qualcomm PDC series v4 (GPIO wake through PDC, X1E PDC secondary mode, pinctrl, and the `domain_ss3` system idle state `0x0200c354` in `hamoa.dtsi`). | **Merged upstream** (current master has the X1E quirk and `domain_ss3`). |
+| `serial-qcom-geni-force-suspend-resume.patch` | With Bluetooth up, `hci_uart` keeps the BT UART open; `uart_suspend_port()` relies on `pm_runtime_put_sync()`, which does nothing during system suspend, so the UART kept its clocks, interconnect and CX performance votes and the SoC never left DDR-only sleep (`cxsd`/`aosd` = 0). This is the upstream fix "serial: qcom-geni: add force suspend/resume to system sleep callbacks" (Praveen Talari). We first found and fixed it ourselves before learning it was already upstream. | **Upstream**, `d0cd9c8d0fd5` (in 7.3). Needed on 7.2. |
+| `soundwire-qcom-wait-for-irq-thread-before-gating-clock.patch` | `swrm_runtime_suspend()` gates the SoundWire clock while the interrupt thread still touches the controller; the next clock-stop exit can fail with a bus clash and leave a WSA8845 speaker amp `UNATTACHED` until reboot (seen here as speakers going silent). One line: `synchronize_irq()` before gating the clock. | Posted by Oleg Keri on 2026-10-07, not merged yet. Not yet tested on this laptop. |
 | `scmi-qcom-memlat-rfc-v7.patch` | Qualcomm SCMI vendor protocol + memlat (Sibi Sankar, RFC v7). CPUCP scales DDR/LLCC by memory latency. Not needed for sleep; it improved memory bandwidth. | RFC on lore, not merged. |
 
 ## Kernel: our sleep fixes
@@ -69,7 +77,6 @@ vivobook-s15/scripts/       suspend energy log
 | `vivobook-s15/kernel/dts-vivobook-s15-edp-regulator-not-always-on.patch` | `VREG_EDP_3P3` (the 3.3 V supply of the Samsung ATNA56AC03 OLED panel) was `regulator-always-on`, so the panel stayed powered in s2idle. Removing it cut sleep drain from **~1.43 W to ~0.25 W**. The panel driver powers the panel through runtime PM; `regulator-boot-on` is kept. Other X1E boards with the same pattern may have the same leak. | Not upstream; master still has `regulator-always-on`. |
 | `pmdomain-system-sleep-only.patch` | Generic genpd and DT-binding change: a domain idle state marked `system-sleep-only` is never picked by runtime idle, only by system suspend. See "Runtime DRIPS" below. | Not upstream. |
 | `dts-hamoa-add-ss1-idle-state.patch` | Adds platform.SS1 (`0x02000154`, from ACPI `\_SB.SYSM._LPI`) as a shallower system idle state and marks DRIPS `system-sleep-only`. See "Runtime DRIPS" below. | Not upstream. |
-| `tty-serial-qcom-geni-power-down-in-s2idle.patch` | With Bluetooth up, `hci_uart` keeps the BT UART (geni SE `a98000`) open. `uart_suspend_port()` powers it down with `pm_runtime_put_sync()`, but during system suspend the PM core holds a runtime PM reference, so this is a no-op: the SE clocks, interconnect and CX performance votes stayed on through s2idle and AOP never collapsed CX or turned XO off (`cxsd`/`aosd` = 0, DDR-only sleep). The patch forces runtime suspend in the late suspend phase (console and wakeup ports are left alone). Bluetooth keeps working after resume. | Not upstream. |
 | `syscon-skip-clock-of-clock-providers.patch` | syscon attached the parent clock of the TCSR clock provider (`bi_tcxo`) as its register clock and kept it prepared, which pinned an RPMh XO vote. Skip `clocks` for nodes with `#clock-cells`. | Not upstream. |
 | `pcie-qcom-keep-gen1-icc-vote.patch` | After link up, pcie-qcom votes full link bandwidth, which pinned DDR at 2092 MHz while the link idled in L1ss. Keep the boot-time Gen1 x1 vote. Debatable: real DMA traffic relies on the LLCC to DDR BWMON. | Not upstream. |
 
@@ -103,8 +110,8 @@ at EL1.
 
 - **EC driver** (`drivers/platform/arm64/asus-vivobook-s15.c`): fan
   RPM/PWM/profiles, SoC temperature feed, keyboard RGB. Suspend notifies
-  the EC with `0x23 01` and resume with `0x23 00`. This is exactly what
-  Windows sends: the DSDT `PEP0._DSM` Modern Standby entry/exit
+  the EC with `0x23 01` and resume with `0x23 00`. This is what Windows
+  sends (confirmed with a kernel-debugger capture): the DSDT `PEP0._DSM` Modern Standby entry/exit
   (UUID `11e00d56…`, functions 7/8) writes EC command `0x23` on I2C6 at
   address 0x76.
 - **The EC driver is work in progress.** Notes on the EC protocol:
@@ -121,6 +128,12 @@ at EL1.
 - **Keyboard driver** (`hid-asus-vivobook-s15`): Fn hotkeys, backlight,
   Fn-lock.
 - The EC node in the DT.
+
+`vivobook-s15/kernel/ec-timed-standby-experiment.patch`: an opt-in
+experiment (`disable_standby_timer=1`) that clears the EC's timed-standby
+flag (EC RAM `0xca68`) for the duration of system sleep and restores it on
+resume, to test whether an EC timer is behind the hourly resets. It is not
+known to fix anything; off by default.
 
 ## Kernel: DC ZVA and CL5 (`kernel/experimental/`)
 
@@ -140,12 +153,17 @@ at EL1.
 ## Modules
 
 - `el1tmr`, EL2 only:
-  - Under VHE Linux ticks on the EL2 physical timer, while the secure
-    firmware computes the APSS wake-up deadline from the EL1 timers. The
-    module copies the CNTHP deadline into `CNTP_*_EL02` (interrupt masked)
-    before power-down idle states and parks it far away after.
-  - It also disables the EL1 virtual timer that UEFI leaves armed: that
-    timer made the firmware abort every system-level entry.
+  - Under VHE (`HCR_EL2.E2H=1`) the kernel's `CNTP_*_EL0` accesses are
+    redirected to the EL2 physical timer (`CNTHP`), so the host kernel
+    ticks on CNTHP. The `*_EL02` aliases are the only way to reach the EL1
+    timers from the host. The secure firmware computes the APSS wake-up
+    deadline from the EL1 timers (what Windows and EL1 Linux use).
+  - Before power-down idle states the module writes the next CNTHP
+    deadline into `CNTP_CVAL_EL02` (the EL1 physical timer) with the
+    interrupt masked, and parks it far away again on exit.
+  - It also clears `CNTV_CTL_EL02` (the EL1 virtual timer) that UEFI leaves
+    armed and long expired: it made the firmware abort every system-level
+    sleep entry.
   - Do not load it while KVM guests run.
 - `adsp-pwr-lmts` (`qcom_adsp_pwr_lmts`):
   - An rpmsg driver for the ADSP `APPS_ADSP_PWR_LMTS_GLINK_PORT` channel.
@@ -174,7 +192,9 @@ at EL1.
 
 ## Credits
 
-- valpackett: the LPASS macro vote leak.
+- valpackett: the LPASS macro vote leak, pointing out the upstream geni fix.
+- Praveen Talari (Qualcomm): geni serial force suspend.
+- Oleg Keri: the SoundWire clock-gating race fix.
 - Shivam Rawat / Akhil P Oommen: GMU fix.
 - Qualcomm: PDC series, memlat RFC.
 - Marc Zyngier: the DC ZVA erratum.
