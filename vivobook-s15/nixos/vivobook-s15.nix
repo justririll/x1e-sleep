@@ -1,14 +1,27 @@
 # ASUS Vivobook S 15 (S5507QA, Snapdragon X Elite X1E-78/80) hardware support:
 # custom kernel, device tree, firmware and the initrd module set that is known
 # to boot. Shared by the installed system and the installer ISO.
-{ config, lib, pkgs, ... }:
+{ config, lib, pkgs, kernelPkgs, ... }:
 
 let
-  customKernel = pkgs.linuxManualConfig {
+  # ccache for the kernel build (kernelPkgs is a separate nixpkgs, so programs.ccache.packageNames
+  # does not reach it). Cache in /var/cache/ccache, exposed to the sandbox by programs.ccache.
+  kernelCcache = kernelPkgs.ccacheWrapper.override {
+    extraConfig = ''
+      export CCACHE_COMPRESS=1
+      export CCACHE_DIR=/var/cache/ccache
+      export CCACHE_UMASK=007
+      export CCACHE_MAXSIZE=20G
+      export CCACHE_SLOPPINESS=random_seed,include_file_mtime,include_file_ctime,time_macros
+    '';
+  };
+  kernelStdenv = kernelPkgs.overrideCC kernelPkgs.stdenv kernelCcache;
+
+  customKernel = (kernelPkgs.linuxManualConfig.override { stdenv = kernelStdenv; }) {
     version = "7.2.0";
     modDirVersion = "7.2.0";
 
-    src = pkgs.fetchFromGitHub {
+    src = kernelPkgs.fetchFromGitHub {
       owner = "jglathe";
       repo = "linux_ms_dev_kit";
       rev = "0aaff8f";
@@ -23,25 +36,25 @@ let
   # Mainline kernel (2026-10-03 test): torvalds v7.3-rc5 + mainline/*.patch
   # (our sleep/EC patches rebased, EL2 bits from the jglathe tree). Boot entry
   # "mainline" (specialisation), the jglathe kernel stays the default.
-  mainlineKernel = pkgs.linuxManualConfig {
-    version = "7.3.0-rc5";
-    modDirVersion = "7.3.0-rc5";
+#  mainlineKernel = kernelPkgs.linuxManualConfig {
+#    version = "7.3.0-rc5";
+#    modDirVersion = "7.3.0-rc5";
+#
+#    src = kernelPkgs.fetchFromGitHub {
+#      owner = "torvalds";
+#      repo = "linux";
+#      rev = "72d3fcf802c45d00b300f25b848a93c3a2bd7c7e";
+#      hash = "sha256-NrTyfot19uJ1SulXU98z2V+leOjjjLmoueX8pnyvn+o=";
+#    };
+#
+#    configfile = ../config-mainline;
+#    allowImportFromDerivation = true;
+#    features = { efiBootStub = true; };
+#  };
 
-    src = pkgs.fetchFromGitHub {
-      owner = "torvalds";
-      repo = "linux";
-      rev = "72d3fcf802c45d00b300f25b848a93c3a2bd7c7e";
-      hash = "sha256-NrTyfot19uJ1SulXU98z2V+leOjjjLmoueX8pnyvn+o=";
-    };
-
-    configfile = ../config-mainline;
-    allowImportFromDerivation = true;
-    features = { efiBootStub = true; };
-  };
-
-  mainlinePatches = map (f: { name = lib.removeSuffix ".patch" f; patch = ../mainline + "/${f}"; })
-    (lib.sort lib.lessThan (lib.filter (lib.hasSuffix ".patch")
-      (builtins.attrNames (builtins.readDir ../mainline))));
+#  mainlinePatches = map (f: { name = lib.removeSuffix ".patch" f; patch = ../mainline + "/${f}"; })
+#    (lib.sort lib.lessThan (lib.filter (lib.hasSuffix ".patch")
+#      (builtins.attrNames (builtins.readDir ../mainline))));
 
   # Vendor-signed ADSP/CDSP/GPU firmware from the ASUS Windows driver package;
   # linux-firmware doesn't ship the per-device signed blobs.
@@ -203,7 +216,9 @@ let
   ];
 in
 {
-  boot.kernelPackages = pkgs.linuxPackagesFor customKernel;
+  boot.kernelPackages = kernelPkgs.linuxPackagesFor customKernel;
+  programs.ccache.enable = true;  # creates /var/cache/ccache (group nixbld)
+  nix.settings.extra-sandbox-paths = [ "/var/cache/ccache" ];  # visible to kernelCcache in builds
 
   # Linux at EL2/VHE runs on the hyp timer, but the secure firmware picks the APSS wake deadline
   # only from the EL1 CNTP/CNTV timers (2026-09-30: with none armed it refuses system suspend).
@@ -213,7 +228,7 @@ in
   # platform.DRIPS with a 4.5 ms per-CPU resume-latency QoS (SS1/CL5 allowed; s2idle ignores QoS).
   # Only while KVM guests do not run (KVM owns these timers). Source: ./el1tmr.
   boot.extraModulePackages = [
-    (let kernel = config.boot.kernelPackages.kernel; in pkgs.stdenv.mkDerivation {
+    (let kernel = config.boot.kernelPackages.kernel; in kernelPkgs.stdenv.mkDerivation {
       pname = "el1tmr";
       version = "4";
       src = ./el1tmr;
@@ -221,7 +236,7 @@ in
       buildPhase = "make -C ${kernel.dev}/lib/modules/${kernel.modDirVersion}/build M=$PWD modules";
       installPhase = "install -Dm444 el1tmr.ko $out/lib/modules/${kernel.modDirVersion}/extra/el1tmr.ko";
     })
-    (let kernel = config.boot.kernelPackages.kernel; in pkgs.stdenv.mkDerivation {
+    (let kernel = config.boot.kernelPackages.kernel; in kernelPkgs.stdenv.mkDerivation {
       pname = "asus-adsp-sleepstate";
       version = "1";
       src = ./adsp-sleepstate;
@@ -229,7 +244,7 @@ in
       buildPhase = "make -C ${kernel.dev}/lib/modules/${kernel.modDirVersion}/build M=$PWD modules";
       installPhase = "install -Dm444 asus_adsp_sleepstate.ko $out/lib/modules/${kernel.modDirVersion}/extra/asus_adsp_sleepstate.ko";
     })
-    (let kernel = config.boot.kernelPackages.kernel; in pkgs.stdenv.mkDerivation {
+    (let kernel = config.boot.kernelPackages.kernel; in kernelPkgs.stdenv.mkDerivation {
       pname = "qcom-adsp-pwr-lmts";
       version = "1";
       src = ./adsp-pwr-lmts;
@@ -237,23 +252,46 @@ in
       buildPhase = "make -C ${kernel.dev}/lib/modules/${kernel.modDirVersion}/build M=$PWD modules";
       installPhase = "install -Dm444 qcom_adsp_pwr_lmts.ko $out/lib/modules/${kernel.modDirVersion}/extra/qcom_adsp_pwr_lmts.ko";
     })
+    # 2026-10-08 workaround: in AOSD (XO off) the SoC resets at boot + N h + 38 s; CXSD-only
+    # sleep survives (~0.17 W). Disables AOSD via AOSS QMP at load (modules/aoss-cxsd-only).
+    (let kernel = config.boot.kernelPackages.kernel; in kernelPkgs.stdenv.mkDerivation {
+      pname = "aoss-cxsd-only";
+      version = "1";
+      src = ./aoss-cxsd-only;
+      nativeBuildInputs = kernel.moduleBuildDependencies;
+      buildPhase = "make -C ${kernel.dev}/lib/modules/${kernel.modDirVersion}/build M=$PWD modules";
+      installPhase = "install -Dm444 aoss_cxsd_only.ko $out/lib/modules/${kernel.modDirVersion}/extra/aoss_cxsd_only.ko";
+    })
   ];
-  boot.kernelModules = [ "el1tmr" "asus_adsp_sleepstate" "qcom_adsp_pwr_lmts" ];
+  boot.kernelModules = [ "el1tmr" "asus_adsp_sleepstate" "qcom_adsp_pwr_lmts" "aoss_cxsd_only" ];
 
   # The ADSP power-limits (PLD) timer wakes it ~100 times/s unless told the system is in Modern Standby.
   # Windows (qcpep8380.sys) sends MODERN_STANDBY_STATE on APPS_ADSP_PWR_LMTS_GLINK_PORT around sleep;
   # do the same (ADSP then wakes ~2 times/s).
   # sent by the qcom_adsp_pwr_lmts rpmsg driver (modules/adsp-pwr-lmts) from its suspend/resume callbacks
-  powerManagement.powerDownCommands = "${pkgs.bash}/bin/sh ${./sleep-log.sh} pre || true";
-  powerManagement.resumeCommands = "${pkgs.bash}/bin/sh ${./sleep-log.sh} post || true";
+  # The EC pulses the lid GPIO (gpio-keys, gpio92) ~5 min into s2idle even with the
+  # lid open, which fully wakes the laptop. If we suspend with the lid open, drop lid
+  # wakeup for this sleep (power key / keyboard still wake); restore it on resume.
+  powerManagement.powerDownCommands = ''
+    ${pkgs.bash}/bin/sh ${./sleep-log.sh} pre || true
+    if [ "$(${pkgs.systemd}/bin/busctl get-property org.freedesktop.login1 /org/freedesktop/login1 org.freedesktop.login1.Manager LidClosed 2>/dev/null)" = "b false" ]; then
+      echo disabled > /sys/bus/platform/devices/gpio-keys/power/wakeup || true
+    fi
+  '';
+  powerManagement.resumeCommands = ''
+    echo enabled > /sys/bus/platform/devices/gpio-keys/power/wakeup || true
+    ${pkgs.bash}/bin/sh ${./sleep-log.sh} post || true
+  '';
 
   # EC driver (asus_vivobook_ec: SoC temperature feed, fan RPM/PWM/profiles,
   # keyboard RGB) + keyboard driver (hid-asus-vivobook-s15: Fn hotkeys,
   # backlight, Fn-lock, Fn+F fan profile) + the EC node in the device tree.
   # Replaces the old 1/2/3.patch (now in old/). Controlled by
   # modules/vivobook-control.nix.
+  boot.extraModprobeConfig = "options asus_vivobook_s15 disable_standby_timer=1";
   boot.kernelPatches = [
     { name = "vivobook-s15"; patch = ../vivobook-s15.patch; }
+    { name = "ec-timed-standby-experiment"; patch = ../ec-timed-standby-experiment.patch; }
     { name = "pdc-sleep"; patch = ../pdc-sleep.patch; }
     { name = "x1-zva-cl5"; patch = ../x1-zva-cl5.patch; }
     # syscon must not hold the TCSR parent clock (bi_tcxo) prepared: pins xo.lvl ON in suspend
@@ -271,8 +309,11 @@ in
     { name = "dt-ss1"; patch = ../dt-ss1.patch; }
     # panel 3.3 V was always-on, stayed powered in s2idle (2026-10-03 test)
     { name = "dt-edp-off"; patch = ../dt-edp-off.patch; }
-    # BT UART (hci_uart keeps it open) kept clocks/ICC/CX votes in s2idle -> no CXSD/AOSD (2026-10-03)
-    { name = "geni-serial-s2idle"; patch = ../geni-serial-s2idle.patch; }
+    # BT UART (hci_uart keeps it open) kept clocks/ICC/CX votes in s2idle -> no CXSD/AOSD (2026-10-03).
+    # Was our own geni-serial-s2idle.patch; now the upstream fix d0cd9c8d0fd5 (Praveen Talari).
+    { name = "serial-qcom-geni-upstream"; patch = ../serial-qcom-geni-upstream.patch; }
+    # SoundWire: wait for the IRQ thread before gating hclk (bus clash -> WSA8845 UNATTACHED), Oleg Keri
+    { name = "soundwire-qcom-irq-sync"; patch = ../soundwire-qcom-irq-sync.patch; }
   ];
 
   # USB controllers, xHCI and USB PHYs default to power/control=on (runtime PM forbidden), so all
@@ -285,7 +326,7 @@ in
     ACTION=="add", SUBSYSTEM=="devfreq", KERNEL=="ddr|ddr-qos|llcc", ATTR{polling_interval}="0"
   '';
 
-  boot.kernelParams = [
+  boot.kernelParams = [ "asus_vivobook_s15.disable_standby_timer=1"
     "no_console_suspend"  # DEBUG with ramoops: log s2idle to pstore
     # EXPERIMENT 2026-09-29: clk_ignore_unused / pd_ignore_unused removed so Linux turns off what UEFI left on
     # (display/PCIe RSCC clocks etc.). Restore both lines if something breaks at boot.
@@ -408,11 +449,19 @@ in
     '')
   ];
 
-  specialisation.mainline.configuration = {
-    system.nixos.tags = [ "mainline" ];
-    boot.kernelPackages = lib.mkForce (pkgs.linuxPackagesFor mainlineKernel);
-    boot.kernelPatches = lib.mkForce mainlinePatches;
-    # DEBUG: Wi-Fi (pcie4) link never comes up on 7.3
-    boot.kernelParams = [ "dyndbg=\"file drivers/pci/pwrctrl/* +p; file drivers/pci/controller/dwc/* +p; file drivers/power/sequencing/* +p\"" ];
+#  specialisation.mainline.configuration = {
+#    system.nixos.tags = [ "mainline" ];
+#    boot.kernelPackages = lib.mkForce (kernelPkgs.linuxPackagesFor mainlineKernel);
+#    boot.kernelPatches = lib.mkForce mainlinePatches;
+#    # DEBUG: Wi-Fi (pcie4) link never comes up on 7.3
+#    boot.kernelParams = [ "dyndbg=\"file drivers/pci/pwrctrl/* +p; file drivers/pci/controller/dwc/* +p; file drivers/power/sequencing/* +p\"" ];
+#  };
+
+  # HDR10 on the internal OLED (ATNA56AC03: PQ, BT.2020, ~620 nit): drivers/gpu/drm/msm/dp taken
+  # from v7.3-rc5 + "drm/msm/dp: Add static HDR support for DP and eDP" v2 (Xilin Wu, 2026-10-09)
+  # + its 2 linux-next prerequisites, ported to 7.2 (bridge atomic_reset API, max bpc needs a
+  # connector state, jglathe's delayed DP clock defaults kept). Separate boot entry; default unchanged.
+  specialisation.hdr.configuration = {
+    boot.kernelPatches = [ { name = "msm-dp-hdr"; patch = ../msm-dp-hdr.patch; } ];
   };
 }

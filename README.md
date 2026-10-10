@@ -20,15 +20,27 @@ Setup this was tested on:
 - Linux 7.2 from [jglathe/linux_ms_dev_kit](https://github.com/jglathe/linux_ms_dev_kit/tree/jg/ubuntu-qcom-x1e-7.2.y), branch `jg/ubuntu-qcom-x1e-7.2.y` @ `0aaff8f`, NixOS;
 - Linux running at **EL2** through slbounce, with the DSPs started by
   qebspil. Some parts (el1tmr, qebspil) only matter at EL2.
+- The numbers below were measured with the kernel in VHE mode plus
+  `el1tmr`. **nVHE works too** (`id_aa64mmfr1.vh=0`, el1tmr not loaded):
+  the kernel then runs at EL1 on the EL1 timers itself, a small nVHE
+  hypervisor keeps EL2, KVM still works, and full DRIPS was reached. The
+  hourly AOSD reset happens in both modes, so it is not caused by EL2 or
+  el1tmr.
 
 **Known open issue: hard resets in long full-DRIPS sleeps.** The reset
 (`PM: Reset by PSHOLD`, `Reset Type: Hard Reset` in the next boot's XBL
 log) lands at about *N hours + ~38 s after boot*, not at a fixed time after
-suspend, and only while the SoC is in AOSD (XO off). With AOSD inhibited
-over QMP (`{class: aoss_slp, res: sleep, val: disable}`; CXSD and DDR
-sleep stay allowed) a 70 min sleep across that boundary survived, at
-~0.17 W. The periodic trigger and the initiator of the reset are not known
-yet. Not tested at EL1 so far.
+suspend, and only while the SoC is in AOSD (XO off). It also happens on AC
+power. With AOSD enabled the laptop reset almost exactly every ~61 min of
+sleep (2026-10-05…07). The periodic trigger and the initiator of the reset
+are not known yet. Not tested at EL1 so far.
+
+**Current default: CXSD-only sleep.** `modules/aoss-cxsd-only` inhibits
+AOSD over QMP (`{class: aoss_slp, res: sleep, val: disable}`); CX collapse
+and DDR low-power mode stay allowed. Since 2026-10-08 no sleep has ended in
+a reset, including a **16.9 h overnight sleep: 2.93 Wh, ~0.17 W, 99.96% of
+the time in `cxsd`** (about 4 Wh, ~7% of the battery per day). That is not
+worse than the ~0.25 W measured in full DRIPS.
 
 ## Layout
 
@@ -40,7 +52,7 @@ qebspil/                    patch for qebspil (git format-patch against 8e4d9e6)
 kernel/upstream-backports/  fixes taken from upstream or lore
 kernel/sleep/               our own X1E sleep/power fixes
 kernel/experimental/        DC ZVA erratum + CL5
-modules/                    out-of-tree modules (EL2 timer helper, ADSP messages)
+modules/                    out-of-tree modules (EL2 timer helper, ADSP messages, CXSD-only)
 vivobook-s15/kernel/        EC + keyboard drivers and DT fixes for this laptop
 vivobook-s15/nixos/         the NixOS module that wires everything together
 vivobook-s15/scripts/       suspend energy log
@@ -66,7 +78,7 @@ vivobook-s15/scripts/       suspend energy log
 | `drm-msm-a6xx-fix-stale-rpmh-votes.patch` | `a6xx_rpmh_stop()` had an inverted `GMU_STATUS_FW_START` check, so after the GMU had run, the GPU RSC never went to sleep. Its RPMh votes then blocked CXSD and DDR LPM. This was the first big sleep blocker. The backport also halts the GMU CM3 core before `rpmh_stop`, like upstream. | **Merged upstream** ("drm/msm/a6xx: Fix stale rpmh votes after suspend", Shivam Rawat / Akhil P Oommen). Not in 7.2. |
 | `qcom-pdc-wake-and-ss3.patch` | Qualcomm PDC series v4 (GPIO wake through PDC, X1E PDC secondary mode, pinctrl, and the `domain_ss3` system idle state `0x0200c354` in `hamoa.dtsi`). | **Merged upstream** (current master has the X1E quirk and `domain_ss3`). |
 | `serial-qcom-geni-force-suspend-resume.patch` | With Bluetooth up, `hci_uart` keeps the BT UART open; `uart_suspend_port()` relies on `pm_runtime_put_sync()`, which does nothing during system suspend, so the UART kept its clocks, interconnect and CX performance votes and the SoC never left DDR-only sleep (`cxsd`/`aosd` = 0). This is the upstream fix "serial: qcom-geni: add force suspend/resume to system sleep callbacks" (Praveen Talari). We first found and fixed it ourselves before learning it was already upstream. | **Upstream**, `d0cd9c8d0fd5` (in 7.3). Needed on 7.2. |
-| `soundwire-qcom-wait-for-irq-thread-before-gating-clock.patch` | `swrm_runtime_suspend()` gates the SoundWire clock while the interrupt thread still touches the controller; the next clock-stop exit can fail with a bus clash and leave a WSA8845 speaker amp `UNATTACHED` until reboot (seen here as speakers going silent). One line: `synchronize_irq()` before gating the clock. | Posted by Oleg Keri on 2026-10-07, not merged yet. Not yet tested on this laptop. |
+| `soundwire-qcom-wait-for-irq-thread-before-gating-clock.patch` | `swrm_runtime_suspend()` gates the SoundWire clock while the interrupt thread still touches the controller; the next clock-stop exit can fail with a bus clash and leave a WSA8845 speaker amp `UNATTACHED` until reboot (seen here as speakers going silent). One line: `synchronize_irq()` before gating the clock. | Posted by Oleg Keri on 2026-10-07, not merged yet. In this laptop's build since 2026-10-10, being tested. |
 | `scmi-qcom-memlat-rfc-v7.patch` | Qualcomm SCMI vendor protocol + memlat (Sibi Sankar, RFC v7). CPUCP scales DDR/LLCC by memory latency. Not needed for sleep; it improved memory bandwidth. | RFC on lore, not merged. |
 
 ## Kernel: our sleep fixes
@@ -172,6 +184,13 @@ known to fix anything; off by default.
   - On entry the ADSP stops its power-limits timer, which otherwise wakes
     it ~100 times/s.
   - It replaces an earlier userspace script that sent the same message from the suspend hooks.
+- `aoss-cxsd-only` (`aoss_cxsd_only`): the workaround for the hourly
+  resets. At load it sends `{class: aoss_slp, res: sleep, val: disable}`
+  to the AOSS over the existing `qcom_aoss` QMP transport, so AOP never
+  enters AOSD (XO shutdown); CXSD and DDR LPM are still used. Unloading it
+  re-enables AOSD. Note: the `qcom_aoss` debugfs file
+  `prevent_aoss_sleep` sends this command without `val`, which is why a
+  module is used.
 - `adsp-sleepstate`: drives the outbound SMP2P `sleepstate` bit to the
   ADSP like Windows `qcsubsys`: 0x1000 while awake, 0 on suspend. Needs
   the `adsp-sleepstate` DT overlay from `vivobook-s15/nixos/vivobook-s15.nix`.
@@ -184,9 +203,30 @@ known to fix anything; off by default.
   `/var/log/sleep-energy.log`. Drain in W is
   `(e_pre - e_post) / (t_post - t_pre) * 3.6e-3` (energy is in µWh).
 
+## Spurious wake-ups with the lid open
+
+When the laptop suspends with the lid **open** (for example GNOME's idle
+suspend), it woke up again exactly **~5 min 2 s** later, every time. The
+wake IRQ (`/sys/power/pm_wakeup_irq`, `pm_debug_messages`) was
+`gpio_keys` (gpio92), the lid switch: the EC pulses the lid line a few
+minutes into s2idle although the lid did not move. With the lid closed the
+laptop slept 17 h without a spurious wake.
+
+Fix, in `vivobook-s15/nixos/vivobook-s15.nix`
+(`powerManagement.powerDownCommands` / `resumeCommands`): before
+suspend, if logind reports `LidClosed=false`, set
+`/sys/bus/platform/devices/gpio-keys/power/wakeup` to `disabled`; set it
+back to `enabled` on resume. The power key and the keyboard still wake the
+laptop; with the lid closed, opening it still wakes it. Verified: with lid
+wake disabled a lid-open sleep lasted until the power key was pressed.
+
 ## Other settings that matter (see `vivobook-s15/nixos/vivobook-s15.nix`)
 
-- `msm.psr_enabled=0`: PSR caused green stripes on the panel.
+- `msm.psr_enabled=0`: PSR caused green stripes on the panel. Re-tested on
+  2026-10-09: no stripes any more and `self_refresh_active=1`, but idle
+  power with the screen on did not change (~4.05 W either way), and
+  turning the display off and on again (Mutter `PowerSaveMode` 3 → 0) with
+  PSR enabled hard-reset the laptop. So it stays off.
 - `qcrypto` blacklisted: QCE holds an always-on DDR bandwidth vote.
 - `nvme.quirks=1344:5413:simple_suspend`.
 
